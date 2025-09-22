@@ -85,8 +85,15 @@ if uploaded_file:
 
     st.markdown("---")
     st.markdown("## 🔮 Dự báo doanh số")
-    products = st.sidebar.multiselect("Chọn sản phẩm để dự báo", df['Product'].unique(), default=['Cola', 'Beer', 'Green Tea'])
-    periods = st.sidebar.slider("Số tháng dự báo", 1, 12, 6)
+    products = st.sidebar.multiselect(
+        "Chọn sản phẩm để dự báo",
+        df['Product'].unique(),
+        default=['Cola', 'Beer', 'Green Tea']
+    )
+
+    # Cho phép chọn số tháng dự báo dài hơn (tối đa 36 tháng)
+    periods = st.sidebar.slider("Số tháng dự báo", 1, 36, 12)
+
     demands = {}
     for product in products:
         with st.expander(f"Dự báo cho {product}"):
@@ -97,19 +104,36 @@ if uploaded_file:
                 .rename(columns={'Month': 'ds', 'Units Sold': 'y'})
             )
             if len(sub) > 1:
-                model = Prophet(yearly_seasonality=True, weekly_seasonality=False, daily_seasonality=False)
+                model = Prophet(
+                    yearly_seasonality=True,
+                    weekly_seasonality=False,
+                    daily_seasonality=False
+                )
                 model.fit(sub)
+
+                # Tạo future dataframe kéo dài thêm `periods` tháng
                 future = model.make_future_dataframe(periods=periods, freq='M')
                 forecast = model.predict(future)
-                y_true = sub['y'].values[-periods:]
-                y_pred = forecast['yhat'].values[-2*periods:-periods]
-                mae = mean_absolute_error(y_true, y_pred) if len(y_true) == len(y_pred) else None
-                rmse = np.sqrt(mean_squared_error(y_true, y_pred)) if len(y_true) == len(y_pred) else None
-                st.write(f"MAE: {mae:.2f}" if mae else "Không đủ dữ liệu để tính MAE")
-                st.write(f"RMSE: {rmse:.2f}" if rmse else "Không đủ dữ liệu để tính RMSE")
+
+                # Đánh giá sai số nếu đủ dữ liệu lịch sử
+                if len(sub) > periods:
+                    y_true = sub['y'].values[-periods:]
+                    y_pred = forecast['yhat'].values[-2*periods:-periods]
+                    mae = mean_absolute_error(y_true, y_pred)
+                    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+                    st.write(f"MAE: {mae:.2f}")
+                    st.write(f"RMSE: {rmse:.2f}")
+                else:
+                    st.info("Không đủ dữ liệu lịch sử để tính MAE/RMSE")
+
+                # Hiển thị bảng dự báo các tháng cuối
                 st.dataframe(forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].tail(periods))
+
+                # Vẽ biểu đồ dự báo
                 fig2 = model.plot(forecast)
                 st.pyplot(fig2)
+
+                # Lấy dự báo tháng cuối để đưa vào bài toán tối ưu  
                 demands[product] = int(forecast['yhat'].values[-1])
             else:
                 st.warning("Không đủ dữ liệu để dự báo cho sản phẩm này.")
@@ -141,40 +165,51 @@ if uploaded_file:
     max_total = st.sidebar.number_input("Công suất tối đa (chai)", value=2000)
 
     if st.button("Tính tối ưu"):
-        model = LpProblem("soft-drink-optimization", LpMaximize if opt_criteria != "Tối thiểu hóa chi phí nguyên liệu" else LpMinimize)
-        vars = {p: LpVariable(p, lowBound=0, upBound=demands.get(p,0), cat="Integer") for p in products}
+        model = LpProblem(
+            "soft-drink-optimization",
+            LpMaximize if opt_criteria != "Tối thiểu hóa chi phí nguyên liệu" else LpMinimize
+        )
+        vars = {p: LpVariable(p, lowBound=0, upBound=demands.get(p, 0), cat="Integer") for p in products}
 
         # Hàm mục tiêu theo lựa chọn
         if opt_criteria == "Tối đa hóa lợi nhuận":
-            model += lpSum(profits.get(p,0) * vars[p] for p in vars)
+            model += lpSum(profits.get(p, 0) * vars[p] for p in vars)
+            # Ràng buộc: công suất + nguyên liệu
+            model += lpSum(vars[p] for p in vars) <= max_total
+            for resource, limit in resource_limits.items():
+                model += lpSum(resources[resource][p] * vars[p] for p in vars) <= limit
+
         elif opt_criteria == "Tối đa hóa tổng số lượng sản xuất":
             model += lpSum(vars[p] for p in vars)
+            # Ràng buộc: chỉ công suất, không ràng buộc nguyên liệu
+            model += lpSum(vars[p] for p in vars) <= max_total
+
         elif opt_criteria == "Tối thiểu hóa chi phí nguyên liệu":
-            model += lpSum(costs.get(p,0) * vars[p] for p in vars)
+            model += lpSum(costs.get(p, 0) * vars[p] for p in vars)
+            # Ràng buộc: nguyên liệu + nhu cầu dự báo
+            for resource, limit in resource_limits.items():
+                model += lpSum(resources[resource][p] * vars[p] for p in vars) <= limit
+
         elif opt_criteria == "Cân bằng sản lượng các sản phẩm":
-            # Tối thiểu hóa chênh lệch lớn nhất giữa các sản phẩm
             max_var = LpVariable("max_var", lowBound=0)
             for p in vars:
                 model += vars[p] <= max_var
             model += max_var
-
-        # Ràng buộc tổng công suất
-        model += lpSum(vars[p] for p in vars) <= max_total
-
-        # Ràng buộc nguyên liệu
-        for resource, limit in resource_limits.items():
-            model += lpSum(resources[resource][p] * vars[p] for p in vars) <= limit
+            # Ràng buộc: công suất + nguyên liệu
+            model += lpSum(vars[p] for p in vars) <= max_total
+            for resource, limit in resource_limits.items():
+                model += lpSum(resources[resource][p] * vars[p] for p in vars) <= limit
 
         model.solve()
         st.subheader("Kế hoạch sản xuất tối ưu")
         for p in vars:
             st.write(f"{p}: {int(vars[p].value())} (chai)")
         if opt_criteria == "Tối đa hóa lợi nhuận":
-            st.write(f"Lợi nhuận tối đa = {model.objective.value():,.0f} (VND)")
+            st.write(f"Lợi nhuận tối đa = ${model.objective.value():,.0f}")
         elif opt_criteria == "Tối đa hóa tổng số lượng sản xuất":
             st.write(f"Tổng số lượng sản xuất tối đa = {model.objective.value():,.0f} (chai)")
         elif opt_criteria == "Tối thiểu hóa chi phí nguyên liệu":
-            st.write(f"Chi phí nguyên liệu tối thiểu = {model.objective.value():,.0f} (VND)")
+            st.write(f"Chi phí nguyên liệu tối thiểu = ${model.objective.value():,.0f}")
         elif opt_criteria == "Cân bằng sản lượng các sản phẩm":
             st.write(f"Sản lượng tối đa của 1 sản phẩm = {model.objective.value():,.0f} (chai)")
 else:
